@@ -153,7 +153,9 @@ class ParseRequest(BaseModel):
 
 class ParseUrlRequest(BaseModel):
     url: str = Field(..., description="Absolute http(s) URL to fetch and parse")
-    deterministic: bool = Field(False, description="If true, output is reproducible given fetched content")
+    deterministic: bool = Field(
+        False, description="If true, output is reproducible given fetched content"
+    )
 
     # Optional caller-provided id to correlate parses and feedback.
     input_id: str | None = Field(
@@ -192,7 +194,9 @@ class FeedbackRequest(BaseModel):
     )
     input_id: str | None = Field(
         default=None,
-        description="Optional caller-provided id to correlate feedback when parse_id is not available",
+        description=(
+            "Optional caller-provided id to correlate feedback when parse_id is not available"
+        ),
     )
     text: str | None = Field(
         default=None,
@@ -200,7 +204,9 @@ class FeedbackRequest(BaseModel):
     )
     expected: dict[str, Any] = Field(
         default_factory=dict,
-        description="Corrected fields (e.g., event_type, event_subtype, jurisdiction, assets, entities)",
+        description=(
+            "Corrected fields (e.g., event_type, event_subtype, jurisdiction, assets, entities)"
+        ),
     )
     notes: str | None = Field(default=None, description="Optional free-form notes")
 
@@ -235,7 +241,10 @@ class ParseResponse(BaseModel):
     jurisdiction: Jurisdiction
     jurisdiction_basis: JurisdictionBasis | None = Field(
         default=None,
-        description='Optional explanation of how jurisdiction was determined: "explicit" | "implied" | "none".',
+        description=(
+            'Optional explanation of how jurisdiction was determined: '
+            '"explicit" | "implied" | "none".'
+        ),
     )
     jurisdiction_confidence: float | None = Field(
         default=None,
@@ -254,6 +263,236 @@ class ParseResponse(BaseModel):
 
     schema_version: str
     model_version: str
+
+
+class RiskRequest(BaseModel):
+    # Market inputs
+    p_model: float = Field(
+        ..., ge=0.0, le=1.0, description="Your estimated true probability (from /signal or manual)"
+    )
+    p_market: float = Field(
+        ..., ge=0.01, le=0.99, description="Current market price (e.g. 0.55 on Polymarket)"
+    )
+
+    # Portfolio state
+    bankroll: float = Field(..., gt=0, description="Total trading bankroll in USD")
+    deployed: float = Field(0.0, ge=0.0, description="Capital already deployed in open positions")
+
+    # Parser confidence — scales kelly_fraction down for low-confidence signals
+    confidence: float = Field(
+        1.0, ge=0.0, le=1.0, description="Parser confidence (0.0–1.0); scales kelly_fraction"
+    )
+
+    # Config overrides (optional — defaults are conservative starting values)
+    min_edge: float = Field(0.04, ge=0.0, description="Minimum required edge (p_model - p_market)")
+    kelly_fraction: float = Field(
+        0.25, gt=0.0, le=1.0, description="Fractional Kelly multiplier (scaled by confidence)"
+    )
+    max_bet_fraction: float = Field(
+        0.05, gt=0.0, le=1.0, description="Max single bet as fraction of bankroll"
+    )
+    max_exposure_fraction: float = Field(
+        0.30, gt=0.0, le=1.0, description="Max total deployed as fraction of bankroll"
+    )
+    var_tolerance: float = Field(
+        0.10, gt=0.0, le=1.0, description="Max acceptable VaR95 as fraction of bankroll"
+    )
+
+    # Time-to-expiry scaling — shorter horizon = more conviction = higher position
+    days_to_expiry: int | None = Field(
+        None,
+        ge=1,
+        description=(
+            "Days until market resolution. When provided, scales Kelly fraction "
+            "down for longer-horizon markets "
+            "(day 1 = 1.0×, day 10 = 0.5×). Has no effect when None."
+        ),
+    )
+
+    # Atomic capital reservation (server-side tracking)
+    auto_reserve: bool = Field(
+        False,
+        description=(
+            "If true and verdict=GO, atomically reserve bet_size in server-side deployed "
+            "capital ledger. `deployed` field is ignored and the server reads current capital."
+        ),
+    )
+    bet_id: str | None = Field(
+        None, description="Caller-provided idempotency key; prevents double-reservation on retry"
+    )
+
+
+class RuleResult(BaseModel):
+    name: str
+    passed: bool
+    value: float | None = None
+    threshold: float | None = None
+    message: str
+
+
+class RiskResponse(BaseModel):
+    verdict: str = Field(..., description="GO or NO_GO")
+    bet_size: float | None = Field(
+        None, description="Recommended bet size in USD (only present on GO)"
+    )
+    ev: float | None = Field(None, description="Expected value of the recommended bet in USD")
+    kelly_full: float | None = Field(None, description="Full Kelly bet size for reference")
+    rules: list[RuleResult]
+    edge: float
+    kelly_f: float = Field(..., description="Raw Kelly fraction f*")
+
+
+class SignalRequest(BaseModel):
+    text: str = Field(..., description="Crypto-related news text to derive a market signal from")
+    market_question: str | None = Field(
+        None,
+        description=(
+            "Optional prediction market question. "
+            "Required for LLM-powered p_model estimation (when LLM_ENABLE=1); "
+            "absence forces heuristic path even when LLM is enabled."
+        ),
+    )
+    deterministic: bool = Field(False, description="If true, output is reproducible")
+    input_id: str | None = Field(
+        None,
+        description="Optional caller-provided identifier for correlating requests",
+    )
+
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, value: str) -> str:
+        if value is None:
+            raise ValueError("text is required")
+        value = value.strip()
+        if not value:
+            raise ValueError("text must be non-empty")
+        return value
+
+
+class SignalResponse(BaseModel):
+    p_model: float = Field(
+        ..., ge=0.0, le=1.0, description="Directional probability signal (0.0–1.0)"
+    )
+    p_model_method: str = Field(
+        ..., description='Computation path that produced p_model: "llm" or "heuristic"'
+    )
+    signal_prompt_version: str | None = Field(
+        None, description="Prompt version used to produce p_model (None for heuristic path)"
+    )
+    market_direction: MarketDirection = Field(
+        ..., description="bullish / bearish / neutral derived from p_model"
+    )
+    event_type: EventType
+    sentiment: Sentiment
+    impact_score: float = Field(..., ge=0.0, le=1.0)
+    confidence: float = Field(..., ge=0.0, le=1.0)
+    assets: list[str]
+    jurisdiction: Jurisdiction
+    schema_version: str
+    model_version: str
+
+
+class TrackMarketRequest(BaseModel):
+    condition_id: str = Field(..., description="Polymarket condition ID for the market")
+    question: str | None = Field(
+        None, description="Human-readable market question (optional, for records)"
+    )
+    parse_id: int | None = Field(
+        None, description="Optional parse_id to link this market to a parse run"
+    )
+    input_id: str | None = Field(None, description="Optional caller-provided id for correlation")
+
+
+class TrackMarketResponse(BaseModel):
+    market_id: int
+    condition_id: str
+    status: str = "tracked"
+
+
+class PollResolutionItem(BaseModel):
+    condition_id: str
+    outcome: str
+    feedback_id: int
+
+
+class PollResolutionsResponse(BaseModel):
+    resolved: list[PollResolutionItem]
+    checked: int
+    errors: list[str]
+
+
+class FlowScanRequest(BaseModel):
+    top_n: int = Field(20, ge=1, le=50, description="Number of top-volume markets to scan")
+    max_days: int = Field(
+        7, ge=1, le=90, description="Only scan markets resolving within this many days"
+    )
+    min_liquidity: float = Field(10_000, ge=0, description="Minimum market liquidity in USDC")
+    condition_id: str | None = Field(
+        None, description="Scan a single market by condition ID, bypassing the filters above"
+    )
+    max_wallets: int | None = Field(
+        None,
+        ge=10,
+        le=2000,
+        description=(
+            "Cap metadata lookups to the top-N wallets by position size per market "
+            "(the slow part of a scan). None = all wallets (full fidelity, can take "
+            "15+ minutes on high-volume markets)."
+        ),
+    )
+
+
+class FlowNewWallet(BaseModel):
+    wallet_address: str
+    side: str
+    usdc_size: float
+    wallet_age_days: int
+
+
+class FlowMarketResult(BaseModel):
+    market_id: str
+    market_question: str
+    signal_score: int = Field(..., ge=0, le=100)
+    risk_tier: str = Field(..., description="LOW | MEDIUM | HIGH")
+    dominant_side: str | None = Field(
+        None, description="YES | NO, or null when no new-wallet activity"
+    )
+    dominant_side_usdc: float
+    dominant_side_count: int
+    dominant_side_count_pct: float
+    new_wallet_count_yes: int
+    new_wallet_count_no: int
+    new_wallet_usdc_yes: float
+    new_wallet_usdc_no: float
+    new_wallet_count_total: int
+    new_wallet_total_usdc: float
+    recent_burst_pct: float
+    p_market_at_scan: float | None = Field(
+        None, description="Market YES implied probability at scan time"
+    )
+    days_to_resolution: int
+    new_wallets: list[FlowNewWallet] = Field(default_factory=list)
+    summary: str
+
+
+class FlowScanResponse(BaseModel):
+    results: list[FlowMarketResult]
+    scanned: int
+    stored: bool = Field(..., description="Whether scan rows were persisted")
+
+
+class FlowCalibrationBucket(BaseModel):
+    n: int
+    wins: int
+    win_rate: float | None
+    avg_implied: float | None
+    lift: float | None
+
+
+class FlowCalibrationResponse(BaseModel):
+    overall: FlowCalibrationBucket
+    tiers: dict[str, FlowCalibrationBucket]
+    excluded: int
 
 
 class ErrorEnvelope(BaseModel):

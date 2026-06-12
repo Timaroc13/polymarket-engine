@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import asyncio
+import json
+import logging
 import os
+import urllib.error
+import urllib.request
 from typing import Any
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
-from .llm_adapter import RefinementRequest, get_provider_from_env, stable_seed
 from .fetch import (
     FetchBlockedError,
     FetchError,
@@ -16,6 +21,12 @@ from .fetch import (
     FetchTooLargeError,
     FetchUnsupportedContentTypeError,
     fetch_url_text,
+)
+from .llm_adapter import (
+    SIGNAL_PROMPT_VERSION,
+    RefinementRequest,
+    get_provider_from_env,
+    stable_seed,
 )
 from .models import (
     MAX_TEXT_LENGTH,
@@ -25,22 +36,52 @@ from .models import (
     EventTypeV1,
     FeedbackRequest,
     FeedbackResponse,
+    FlowCalibrationResponse,
+    FlowMarketResult,
+    FlowScanRequest,
+    FlowScanResponse,
+    MarketDirection,
     ParseRequest,
-    ParseUrlRequest,
     ParseResponse,
+    ParseUrlRequest,
+    PollResolutionItem,
+    PollResolutionsResponse,
+    RiskRequest,
+    RiskResponse,
+    SignalRequest,
+    SignalResponse,
+    TrackMarketRequest,
+    TrackMarketResponse,
 )
 from .parser import (
     CandidateEvent,
+    compute_market_signal,
     extract_assets,
     extract_entities,
     infer_event_subtype,
     infer_sentiment,
-    resolve_jurisdiction,
     resolve_jurisdiction_with_meta,
     select_primary_event,
 )
+from .risk import validate_risk
+from .storage import (
+    get_deployed_capital,
+    get_flow_calibration,
+    get_unresolved_markets,
+    mark_market_resolved,
+    persistence_enabled,
+    release_capital,
+    reserve_capital,
+    reset_deployed_capital,
+    store_feedback,
+    store_flow_scan,
+    store_parse_run,
+    track_market,
+    track_market_if_new,
+)
+from .wallet_flow import run_scan
 
-from .storage import persistence_enabled, store_feedback, store_parse_run
+load_dotenv()  # Load .env into os.environ so LLM_ENABLE, GEMINI_API_KEY etc. are available
 
 SCHEMA_VERSION = "v2"
 MODEL_VERSION = os.getenv("MODEL_VERSION", "news-parser-0.1")
@@ -124,7 +165,7 @@ async def _maybe_refine(
 async def enforce_json_content_type(request: Request, call_next):
     # Enforce JSON input (PRD: 415 for unsupported media type).
     # Do this in middleware so it runs before FastAPI attempts to parse/validate the body.
-    if request.method.upper() == "POST" and request.url.path in {"/parse", "/parse_url"}:
+    if request.method.upper() == "POST" and request.url.path in {"/parse", "/parse_url", "/signal"}:
         content_type = request.headers.get("content-type")
         if content_type is not None:
             ct = content_type.split(";", 1)[0].strip().lower()
@@ -384,7 +425,7 @@ async def feedback(
         raise HTTPException(
             status_code=422,
             detail=_error_payload("INVALID_REQUEST", str(e)),
-        )
+        ) from e
 
     return FeedbackResponse(feedback_id=fid)
 
@@ -403,27 +444,29 @@ async def parse_url(
         raise HTTPException(
             status_code=400,
             detail=_error_payload("URL_BLOCKED", str(e), details={"url": req.url}),
-        )
+        ) from e
     except FetchTooLargeError as e:
         raise HTTPException(
             status_code=413,
             detail=_error_payload("FETCH_TOO_LARGE", str(e), details={"url": req.url}),
-        )
+        ) from e
     except FetchTimeoutError as e:
         raise HTTPException(
             status_code=504,
             detail=_error_payload("FETCH_TIMEOUT", str(e), details={"url": req.url}),
-        )
+        ) from e
     except FetchUnsupportedContentTypeError as e:
         raise HTTPException(
             status_code=415,
-            detail=_error_payload("UNSUPPORTED_FETCH_CONTENT_TYPE", str(e), details={"url": req.url}),
-        )
+            detail=_error_payload(
+                "UNSUPPORTED_FETCH_CONTENT_TYPE", str(e), details={"url": req.url}
+            ),
+        ) from e
     except FetchError as e:
         raise HTTPException(
             status_code=502,
             detail=_error_payload("FETCH_FAILED", str(e), details={"url": req.url}),
-        )
+        ) from e
 
     # Reuse the main parse pipeline using extracted text.
     try:
@@ -450,5 +493,302 @@ async def parse_url(
                 "Fetched content could not be converted into a valid parse request.",
                 details={"url": req.url, "errors": errors},
             ),
-        )
+        ) from e
     return await parse(parse_req, authorization=authorization, response=response)
+
+
+@app.post("/signal", response_model=SignalResponse)
+async def signal(
+    req: SignalRequest,
+    authorization: str | None = Header(default=None),
+) -> SignalResponse:
+    _require_api_key(authorization)
+
+    if len(req.text) > MAX_TEXT_LENGTH:
+        raise HTTPException(
+            status_code=413,
+            detail=_error_payload(
+                code="PAYLOAD_TOO_LARGE",
+                message=f"text exceeds max length {MAX_TEXT_LENGTH}",
+                details={"max_length": MAX_TEXT_LENGTH},
+            ),
+        )
+
+    primary = select_primary_event(req.text)
+    assets = extract_assets(req.text)
+    entities = extract_entities(req.text)
+    jurisdiction, _, _ = resolve_jurisdiction_with_meta(req.text)
+    sentiment = infer_sentiment(req.text)
+
+    primary, assets, entities = await _maybe_refine(
+        ParseRequest(text=req.text, deterministic=req.deterministic),
+        primary,
+        assets,
+        entities,
+    )
+
+    p_model_method = "heuristic"
+    signal_prompt_version: str | None = None
+    p_model, market_direction = compute_market_signal(
+        sentiment, primary.impact_score, primary.confidence
+    )
+
+    llm_provider = get_llm_provider()
+    if llm_provider is not None and req.market_question is not None:
+        llm_p = await llm_provider.estimate_p_model(req.market_question, req.text)
+        if llm_p is not None:
+            p_model = llm_p
+            if p_model > 0.55:
+                market_direction = MarketDirection.bullish
+            elif p_model < 0.45:
+                market_direction = MarketDirection.bearish
+            else:
+                market_direction = MarketDirection.neutral
+            p_model_method = "llm"
+            signal_prompt_version = SIGNAL_PROMPT_VERSION
+
+    return SignalResponse(
+        p_model=round(p_model, 4),
+        p_model_method=p_model_method,
+        signal_prompt_version=signal_prompt_version,
+        market_direction=market_direction,
+        event_type=primary.event_type,
+        sentiment=sentiment,
+        impact_score=primary.impact_score,
+        confidence=primary.confidence,
+        assets=assets,
+        jurisdiction=jurisdiction,
+        schema_version=SCHEMA_VERSION,
+        model_version=MODEL_VERSION,
+    )
+
+
+@app.post("/risk", response_model=RiskResponse)
+async def risk(
+    req: RiskRequest,
+    authorization: str | None = Header(default=None),
+) -> RiskResponse:
+    _require_api_key(authorization)
+    if req.auto_reserve and persistence_enabled():
+        # Replace caller-supplied deployed with server-side atomic value
+        current_deployed = get_deployed_capital()
+        req = req.model_copy(update={"deployed": current_deployed})
+    result = validate_risk(req)
+    if (
+        req.auto_reserve
+        and persistence_enabled()
+        and result.verdict == "GO"
+        and result.bet_size is not None
+    ):
+        reserve_capital(result.bet_size, bet_id=req.bet_id)
+    return result
+
+
+@app.get("/deployed")
+async def get_deployed(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Return the current server-side deployed capital."""
+    _require_api_key(authorization)
+    if not persistence_enabled():
+        return {"deployed": 0.0, "note": "persistence disabled — use manual deployed tracking"}
+    return {"deployed": round(get_deployed_capital(), 2)}
+
+
+@app.post("/deployed/release")
+async def release_deployed(
+    body: dict[str, Any],
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Release (subtract) capital when a bet is settled or cancelled."""
+    _require_api_key(authorization)
+    if not persistence_enabled():
+        return {"deployed": 0.0, "note": "persistence disabled"}
+    amount = float(body.get("amount", 0.0))
+    new_total = release_capital(amount)
+    return {"deployed": round(new_total, 2)}
+
+
+@app.post("/deployed/reset")
+async def reset_deployed(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Reset deployed capital to zero (start of new trading session)."""
+    _require_api_key(authorization)
+    if not persistence_enabled():
+        return {"deployed": 0.0, "note": "persistence disabled"}
+    reset_deployed_capital()
+    return {"deployed": 0.0}
+
+
+@app.post("/flow-scan", response_model=FlowScanResponse)
+async def flow_scan(
+    req: FlowScanRequest,
+    authorization: str | None = Header(default=None),
+) -> FlowScanResponse:
+    """Scan Polymarket markets for informed-trading flow (new-wallet detector).
+
+    Blocking external API calls run in a worker thread; a 20-market scan can
+    take minutes. Intended to be called on a schedule (e.g. n8n cron).
+    """
+    _require_api_key(authorization)
+
+    results = await asyncio.to_thread(
+        run_scan,
+        top_n=req.top_n,
+        max_days=req.max_days,
+        min_liquidity=req.min_liquidity,
+        condition_id=req.condition_id,
+        max_wallets=req.max_wallets,
+    )
+
+    stored = False
+    if persistence_enabled():
+        for r in results:
+            store_flow_scan(result=r)
+            if r.get("market_id"):
+                track_market_if_new(
+                    condition_id=str(r["market_id"]),
+                    question=r.get("market_question"),
+                )
+        stored = True
+
+    return FlowScanResponse(
+        results=[FlowMarketResult(**r) for r in results],
+        scanned=len(results),
+        stored=stored,
+    )
+
+
+@app.get("/flow-calibration", response_model=FlowCalibrationResponse)
+async def flow_calibration(
+    authorization: str | None = Header(default=None),
+) -> FlowCalibrationResponse:
+    """Report flow-scan calibration: dominant-side win rate vs. implied probability."""
+    _require_api_key(authorization)
+
+    if not persistence_enabled():
+        raise HTTPException(
+            status_code=400,
+            detail=_error_payload(
+                "PERSISTENCE_DISABLED",
+                "Flow calibration is unavailable because persistence is disabled.",
+            ),
+        )
+
+    return FlowCalibrationResponse(**get_flow_calibration())
+
+
+_POLYMARKET_CLOB_URL = "https://clob.polymarket.com/markets/{condition_id}"
+
+
+def _fetch_polymarket_market(condition_id: str) -> dict[str, Any] | None:
+    """Fetch market data from Polymarket CLOB API. Returns the parsed JSON or None on error."""
+    url = _POLYMARKET_CLOB_URL.format(condition_id=condition_id)
+    req = urllib.request.Request(url, headers={"Accept": "application/json"}, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Polymarket fetch failed for %s: %s", condition_id, exc)
+        return None
+
+
+@app.post("/track-market", response_model=TrackMarketResponse)
+async def track_market_endpoint(
+    req: TrackMarketRequest,
+    authorization: str | None = Header(default=None),
+) -> TrackMarketResponse:
+    """Register a Polymarket market for resolution tracking."""
+    _require_api_key(authorization)
+
+    if not persistence_enabled():
+        raise HTTPException(
+            status_code=400,
+            detail=_error_payload(
+                "PERSISTENCE_DISABLED",
+                "Market tracking is unavailable because persistence is disabled.",
+            ),
+        )
+
+    try:
+        market_id = track_market(
+            condition_id=req.condition_id,
+            question=req.question,
+            parse_id=req.parse_id,
+            input_id=req.input_id,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=_error_payload("INVALID_REQUEST", str(exc)),
+        ) from exc
+
+    return TrackMarketResponse(market_id=market_id, condition_id=req.condition_id)
+
+
+@app.post("/poll-resolutions", response_model=PollResolutionsResponse)
+async def poll_resolutions(
+    authorization: str | None = Header(default=None),
+) -> PollResolutionsResponse:
+    """Check Polymarket for resolved markets and auto-POST /feedback for each resolution.
+
+    Queries the local DB for all tracked markets that haven't been resolved yet,
+    calls the Polymarket CLOB API for each, and if resolved, stores feedback and
+    marks the market as resolved.
+
+    This endpoint is intended to be called manually or by a scheduler (e.g. n8n cron).
+    """
+    _require_api_key(authorization)
+
+    if not persistence_enabled():
+        raise HTTPException(
+            status_code=400,
+            detail=_error_payload(
+                "PERSISTENCE_DISABLED",
+                "Resolution polling is unavailable because persistence is disabled.",
+            ),
+        )
+
+    markets = get_unresolved_markets()
+    resolved_items: list[PollResolutionItem] = []
+    errors: list[str] = []
+
+    for market in markets:
+        data = _fetch_polymarket_market(market.condition_id)
+        if data is None:
+            errors.append(f"{market.condition_id}: failed to fetch from Polymarket")
+            continue
+
+        # Polymarket CLOB API: `resolved` bool + `outcome` string when resolved
+        is_resolved = bool(data.get("resolved") or data.get("closed"))
+        outcome = data.get("outcome") or data.get("winning_outcome")
+
+        if not is_resolved or not outcome:
+            continue
+
+        # Auto-POST to /feedback
+        try:
+            fid = store_feedback(
+                parse_id=market.parse_id,
+                input_id=market.input_id,
+                text=None,
+                expected={"outcome": outcome, "condition_id": market.condition_id},
+                notes=f"Auto-resolved via poll-resolutions: outcome={outcome}",
+            )
+            mark_market_resolved(condition_id=market.condition_id, outcome=str(outcome))
+            resolved_items.append(
+                PollResolutionItem(
+                    condition_id=market.condition_id,
+                    outcome=str(outcome),
+                    feedback_id=fid,
+                )
+            )
+        except Exception as exc:
+            errors.append(f"{market.condition_id}: feedback storage failed: {exc}")
+
+    return PollResolutionsResponse(
+        resolved=resolved_items,
+        checked=len(markets),
+        errors=errors,
+    )
