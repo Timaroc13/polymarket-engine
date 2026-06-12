@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from .models import EventType, Jurisdiction, Sentiment
+from .models import EventType, Jurisdiction, MarketDirection, Sentiment
 
 
 @dataclass(frozen=True)
@@ -519,8 +519,10 @@ def infer_event_subtype(text: str, event_type: EventType) -> str | None:
             return "capital_markets.ipo.filing"
         if "ipo" in t and any(w in t for w in ["plans", "planning", "considering", "exploring"]):
             return "capital_markets.ipo.planning"
-        # Allow IPO-debut inference without literal "ipo" if the story says "market debut" on a major exchange.
-        if any(w in t for w in ["market debut", "first day of trading", "began trading", "priced", "debut"]):
+        # Allow IPO-debut inference without literal "ipo" if the story says
+        # "market debut" on a major exchange.
+        debut_words = ["market debut", "first day of trading", "began trading", "priced", "debut"]
+        if any(w in t for w in debut_words):
             if any(w in t for w in ["nyse", "nasdaq"]):
                 return "capital_markets.ipo.market_debut"
         if "ipo" in t and any(w in t for w in ["debut", "began trading", "priced", "listed"]):
@@ -650,6 +652,44 @@ def infer_event_subtype(text: str, event_type: EventType) -> str | None:
     return None
 
 
+def compute_market_signal(
+    sentiment: Sentiment,
+    impact_score: float,
+    confidence: float,
+) -> tuple[float, MarketDirection]:
+    """Derive (p_model, market_direction) from parsed event signals.
+
+    Formula (from design.md):
+        sentiment_adj  = +0.25 | -0.25 | 0.0
+        impact_weight  = 0.5 + impact_score * 0.5   # maps [0,1] → [0.5, 1.0]
+        raw_adj        = sentiment_adj * impact_weight * confidence
+        p_model        = clamp(0.5 + raw_adj, 0.05, 0.95)
+
+    Thresholds for market_direction:
+        p_model > 0.55  → bullish
+        p_model < 0.45  → bearish
+        else            → neutral
+    """
+    sentiment_map = {
+        Sentiment.positive: 0.25,
+        Sentiment.negative: -0.25,
+        Sentiment.neutral: 0.0,
+    }
+    sentiment_adj = sentiment_map[sentiment]
+    impact_weight = 0.5 + impact_score * 0.5
+    raw_adj = sentiment_adj * impact_weight * confidence
+    p_model = max(0.05, min(0.95, 0.5 + raw_adj))
+
+    if p_model > 0.55:
+        direction = MarketDirection.bullish
+    elif p_model < 0.45:
+        direction = MarketDirection.bearish
+    else:
+        direction = MarketDirection.neutral
+
+    return p_model, direction
+
+
 def _candidates(text: str) -> list[CandidateEvent]:
     t = text.lower()
     candidates: list[CandidateEvent] = []
@@ -670,23 +710,6 @@ def _candidates(text: str) -> list[CandidateEvent]:
         add(EventType.SECURITY_INCIDENTS_EXPLOITS, confidence=0.74, impact_score=0.9)
 
     # Regulatory action & enforcement
-    enforcement_words = [
-        "lawsuit",
-        "sues",
-        "sued",
-        "charges",
-        "charged",
-        "indict",
-        "indicted",
-        "fine",
-        "penalty",
-        "settlement",
-        "investigation",
-        "probe",
-        "cease and desist",
-        "cease-and-desist",
-        "c&d",
-    ]
     enforcement_re = re.compile(
         r"\b(lawsuit|sues|sued|charges|charged|indict|indicted|fine|fined|penalty|penalties|settlement|investigation|probe|c&d)\b"
         r"|\bcease\s+and\s+desist\b|\bcease-and-desist\b"
@@ -737,7 +760,8 @@ def _candidates(text: str) -> list[CandidateEvent]:
     # Capital markets activity
     if any(w in t for w in ["ipo", "spac", "public offering", "market debut"]):
         add(EventType.CAPITAL_MARKETS_ACTIVITY, confidence=0.66, impact_score=0.6)
-    # Avoid false positives where "listed" is just an adjective ("a listed company reported revenue...").
+        # Avoid false positives where "listed" is just an adjective
+        # ("a listed company reported revenue...").
     if (
         any(w in t for w in ["listing", "delist", "delisted", "delisting"])
         or re.search(r"\blisted\s+on\b", t)

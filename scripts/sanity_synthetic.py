@@ -147,12 +147,16 @@ def main() -> None:
     for et in sorted(event_types):
         print(f"- {et}: {ctr_event_type.get(et, 0)}")
 
-    ctr_jurisdiction = Counter([e.get("jurisdiction") for e in expected_dicts if e.get("jurisdiction")])
+    ctr_jurisdiction = Counter(
+        [e.get("jurisdiction") for e in expected_dicts if e.get("jurisdiction")]
+    )
     print("\ncoverage_jurisdiction:")
     for j in sorted(jurisdictions):
         print(f"- {j}: {ctr_jurisdiction.get(j, 0)}")
 
-    ctr_subtype = Counter([e.get("event_subtype") for e in expected_dicts if e.get("event_subtype")])
+    ctr_subtype = Counter(
+        [e.get("event_subtype") for e in expected_dicts if e.get("event_subtype")]
+    )
     print("\ncoverage_event_subtype (top 30):")
     for st, n in ctr_subtype.most_common(30):
         print(f"- {st}: {n}")

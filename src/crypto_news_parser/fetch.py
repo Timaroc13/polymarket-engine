@@ -44,7 +44,10 @@ _MAX_BYTES: Final[int] = 2 * 1024 * 1024  # 2 MiB
 
 _NOISE_LINE_PATTERNS: Final[list[re.Pattern[str]]] = [
     # Common publisher boilerplate / UI chrome
-    re.compile(r"(?i)\b(read more|advertisement|sponsored|subscribe|newsletter|sign up|terms\b|privacy policy|cookie)\b"),
+    re.compile(
+        r"(?i)\b(read more|advertisement|sponsored|subscribe|newsletter"
+        r"|sign up|terms\b|privacy policy|cookie)\b"
+    ),
     re.compile(r"(?i)\b(story continues below|enter your email|by signing up|make us preferred)\b"),
     re.compile(r"(?i)\b(twitter|linkedin|facebook|email)\b"),
     re.compile(r"(?i)\b(ui roboto|helvetica|arial|emoji|seg[o0]e)\b"),
@@ -82,7 +85,9 @@ def _cleanup_extracted_text(text: str) -> str:
         if any(p.search(ln) for p in _NOISE_LINE_PATTERNS):
             continue
         # Drop lines that look like nav breadcrumbs / section labels.
-        if re.fullmatch(r"(?i)(markets|policy|business|tech|prices|research|consensus|data|indices)", ln):
+        if re.fullmatch(
+            r"(?i)(markets|policy|business|tech|prices|research|consensus|data|indices)", ln
+        ):
             continue
 
         lines_out.append(ln)
@@ -210,7 +215,9 @@ async def fetch_url_text(url: str) -> FetchResult:
 
             content_type = (resp.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
             if content_type not in {"text/html", "text/plain"}:
-                raise FetchUnsupportedContentTypeError(f"Unsupported content-type: {content_type or 'unknown'}")
+                    raise FetchUnsupportedContentTypeError(
+                        f"Unsupported content-type: {content_type or 'unknown'}"
+                    )
 
             # Read with a hard cap.
             content = b""

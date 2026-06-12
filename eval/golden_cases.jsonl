@@ -123,13 +123,13 @@
   "expected": {
     "event_type": "MARKET_STRUCTURE_LIQUIDITY_SHIFTS",
     "event_subtype": "markets.volatility",
-    "jurisdiction": "US",
+    "jurisdiction": "GLOBAL",
     "assets": [
       "BTC"
     ],
     "sentiment": "negative",
     "v1_event_type": "UNKNOWN",
-    "v1_jurisdiction": "US"
+    "v1_jurisdiction": "GLOBAL"
   }
 }
 {
