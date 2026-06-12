@@ -1,5 +1,6 @@
 -r requirements.txt
 pytest>=8.0
+pytest-asyncio>=1.0
 httpx>=0.26
 # Pinned: CI must match local; newer ruff enables rules (e.g. UP042) that fail the build
 ruff==0.14.14

@@ -24,8 +24,9 @@ where = ["src"]
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0",
+  "pytest-asyncio>=1.0",
   "httpx>=0.26",
-  "ruff>=0.6",
+  "ruff==0.14.14",
 ]
 
 [tool.ruff]
