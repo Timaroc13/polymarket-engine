@@ -93,6 +93,12 @@ For flagged flow, track market price movement since the flagged wallets' average
 
 ## 🟢 Lower Priority
 
+### BL-18: Strategies Layout + Package Rename
+Repo renamed to `polymarket-engine` (June 2026). Finish the identity change structurally: move signal sources under a `strategies/` package (news_signal, wallet_flow, future hk_temp), rename the `crypto_news_parser` package to match, keep the platform core (risk, ledger, storage, calibration) at top level.
+- **Why**: the repo is a multi-strategy trading platform; the package name and flat layout still say "news parser"
+- **Effort**: Medium — mechanical moves + import updates; do it alongside an approved code change, not as a standalone churn PR
+- **OpenSpec candidate**: `refactor-strategies-layout`
+
 ### BL-07: Multi-Outcome Market Support
 Polymarket has markets with 3+ outcomes (e.g., "Which chain will have highest TVL?").
 Currently the pipeline only handles binary YES/NO markets (first outcome price only).

@@ -1,8 +1,16 @@
-# crypto-news-parser
+# polymarket-engine
 
-API-first service that converts unstructured crypto-related text into a single canonical event object, plus a Polymarket trading-signal pipeline (`/signal`, `/risk`, `/flow-scan`).
+Prediction-market trading platform: signal generation, hard-rule risk management (Kelly/VaR), a shared capital ledger, and outcome-based calibration for every signal source.
 
-See [METHODOLOGY.md](METHODOLOGY.md) for the wallet-flow signal methodology, validation gates, and operational runbook.
+Signal sources (each validated independently against resolved markets before it sizes bets):
+
+- **news-signal** — crypto news → `p_model` via LLM (`/parse`, `/signal`); the project's legacy origin
+- **wallet-flow** — Polymarket informed-trading detection from on-chain wallet behaviour (`/flow-scan`)
+- **hk-temp** — HK temperature markets bot (separate repo [hk-weather-bot](https://github.com/Timaroc13/hk-weather-bot); shares this engine's `/risk` ledger per the `add-strategy-capital-tags` proposal)
+
+See [METHODOLOGY.md](METHODOLOGY.md) for the validation methodology, decision gates, and operational runbook.
+
+> Historical note: this repo began as a B2B "crypto news → structured JSON" API (see `Crypto News PRD.md`), hence the `crypto_news_parser` package name. The platform parts (risk, ledger, calibration) are strategy-agnostic; a `strategies/` restructure is tracked as BL-18.
 
 ## Quickstart (local)
 
