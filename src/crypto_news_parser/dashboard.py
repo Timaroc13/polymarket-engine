@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .paper import get_paper_report
 from .storage import (
     get_calibration_timeline,
     get_dashboard_stats,
@@ -26,6 +27,7 @@ def build_dashboard_data() -> dict[str, Any]:
         "timeline": get_calibration_timeline(),
         "recent_scans": get_recent_scans(limit=50),
         "stats": get_dashboard_stats(),
+        "paper": get_paper_report(),
         "gates": {"gate1_n": GATE1_N, "gate1_lift": GATE1_LIFT},
     }
 
@@ -73,9 +75,13 @@ DASHBOARD_HTML = """<!doctype html>
   <div class="panel"><h2>Lift evolution (per resolution)</h2><canvas id="liftChart" height="110"></canvas><div class="empty" id="liftEmpty" style="display:none">No resolved markets yet — the line starts when the first scanned market resolves.</div></div>
   <div class="panel"><h2>Recent scan tiers</h2><canvas id="tierChart" height="220"></canvas></div>
 </div>
+<div class="row">
+  <div class="panel"><h2>Paper trading equity (flat stake per signal)</h2><canvas id="equityChart" height="110"></canvas><div class="empty" id="equityEmpty" style="display:none">Paper trades appear as scanned markets resolve.</div></div>
+  <div class="panel"><h2>Paper results by tier</h2><div id="paperTiers"></div></div>
+</div>
 <div class="panel"><h2>Latest scans</h2><div id="scans"></div></div>
 <script>
-let liftChart, tierChart;
+let liftChart, tierChart, equityChart;
 const fmt = (v, d=2) => v == null ? '–' : Number(v).toFixed(d);
 const pct = v => v == null ? '–' : (v*100).toFixed(1) + '%';
 const ts = v => v == null ? '–' : new Date(v*1000).toLocaleString();
@@ -111,7 +117,11 @@ async function refresh() {
     card('Deployed capital', '$' + fmt(d.stats.deployed, 2), d.stats.deployed > 0 ? 'warn' : '',
          'should stay $0 during validation') +
     card('Resolved / tracked', `${d.stats.tracked_resolved} / ${d.stats.tracked_resolved + d.stats.tracked_unresolved}`,
-         '', `excluded from math: ${d.calibration.excluded}`);
+         '', `excluded from math: ${d.calibration.excluded}`) +
+    card('Paper PnL (HIGH)', d.paper.tiers.HIGH.pnl == null || d.paper.tiers.HIGH.trades === 0 ? '–' :
+         (d.paper.tiers.HIGH.pnl>=0?'+$':'-$') + Math.abs(d.paper.tiers.HIGH.pnl).toFixed(0),
+         d.paper.tiers.HIGH.trades === 0 ? '' : (d.paper.tiers.HIGH.pnl >= 0 ? 'good' : 'bad'),
+         `$${d.paper.stake}/signal · fee ${(d.paper.fee*100).toFixed(0)}% · ROI ${pct(d.paper.tiers.HIGH.roi)} · max DD $${fmt(d.paper.max_drawdown,0)}`);
 
   // Lift evolution
   const tl = d.timeline;
@@ -137,6 +147,26 @@ async function refresh() {
       backgroundColor:['#f85149','#d29922','#30363d'], borderColor:'#161b22' }] },
     options:{ plugins:{ legend:{ labels:{ color:'#8b949e' } } } } };
   if (tierChart) { tierChart.data = tcfg.data; tierChart.update(); } else { tierChart = new Chart(document.getElementById('tierChart'), tcfg); }
+
+  // Paper equity curve + tier table
+  const pc = d.paper.curve;
+  document.getElementById('equityEmpty').style.display = pc.length ? 'none' : 'block';
+  const ecfg = { type:'line',
+    data: { labels: pc.map(p => p.n), datasets: [
+      { label:'equity (overall)', data: pc.map(p => p.equity), borderColor:'#58a6ff', tension:.2 },
+      { label:'equity (HIGH)', data: pc.map(p => p.equity_high), borderColor:'#3fb950', tension:.2 },
+    ]},
+    options:{ plugins:{ legend:{ labels:{ color:'#8b949e' } } },
+      scales:{ x:{ title:{display:true,text:'paper trades',color:'#8b949e'}, ticks:{color:'#8b949e'}, grid:{color:'#21262d'} },
+               y:{ ticks:{color:'#8b949e', callback:v=>'$'+v}, grid:{color:'#21262d'} } } } };
+  if (equityChart) { equityChart.data = ecfg.data; equityChart.update(); } else { equityChart = new Chart(document.getElementById('equityChart'), ecfg); }
+
+  const ptRows = ['HIGH','MEDIUM','LOW'].map(t => { const b = d.paper.tiers[t];
+    return `<tr><td class="tier-${t}">${t}</td><td>${b.trades}</td><td>${pct(b.win_rate)}</td>` +
+           `<td class="${b.pnl>0?'good':(b.pnl<0?'bad':'')}">$${fmt(b.pnl,0)}</td><td>${pct(b.roi)}</td></tr>`; }).join('');
+  document.getElementById('paperTiers').innerHTML =
+    `<table><tr><th>tier</th><th>trades</th><th>win</th><th>PnL</th><th>ROI</th></tr>${ptRows}</table>` +
+    `<div class="hint" style="color:var(--dim);font-size:11px;margin-top:8px">flat $${d.paper.stake} per signal at scan-time price, ${(d.paper.fee*100).toFixed(0)}% fee on winnings — money lens only, gates still rule</div>`;
 
   // Scan table
   const rows = d.recent_scans.map(s =>

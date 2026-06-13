@@ -584,6 +584,36 @@ def get_calibration_timeline() -> list[dict[str, Any]]:
     return points
 
 
+def get_paper_entries() -> list[dict[str, Any]]:
+    """Qualifying resolved signals for the paper-trading replay, resolution order.
+
+    Each entry: {win, price (dominant-side implied at scan), tier, resolved_at}.
+    Rows without a usable price are excluded (consistent with calibration).
+    """
+    conn = _connect()
+    try:
+        init_db(conn)
+        rows = _calibration_rows(conn)
+    finally:
+        conn.close()
+
+    entries: list[dict[str, Any]] = []
+    for r in rows:
+        qualified = _qualify_row(r)
+        if qualified is None:
+            continue
+        win, implied, tier = qualified
+        if implied is None or not (0.0 < implied < 1.0):
+            continue
+        entries.append({
+            "win": win,
+            "price": implied,
+            "tier": tier,
+            "resolved_at": r["resolved_at"],
+        })
+    return entries
+
+
 def get_recent_scans(limit: int = 50) -> list[dict[str, Any]]:
     """Most recent flow-scan rows, newest first."""
     conn = _connect()
