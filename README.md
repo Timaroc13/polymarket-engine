@@ -87,6 +87,11 @@ pytest
   - When persistence is enabled, every scanned market is logged to `flow_scans` and auto-registered in `tracked_markets`, so resolution polling picks it up.
   - **Slow by design**: a 20-market scan makes hundreds of Polymarket API calls and can take minutes. Prefer the built-in scheduler (below) over interactive calls.
 
+### Dashboard
+
+`GET /dashboard` — localhost KPI page (no auth): Gate-1 progress, HIGH-tier lift,
+lift-evolution chart, tier distribution, and latest scans. Backed by `GET /dashboard/data`.
+
 ### Built-in scheduler
 
 Set `SCHEDULER_ENABLE=1` and the server runs the whole loop itself — flow scan every

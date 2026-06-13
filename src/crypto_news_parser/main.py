@@ -12,10 +12,11 @@ from typing import Any
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import ValidationError
 
 from . import scheduler
+from .dashboard import DASHBOARD_HTML, build_dashboard_data
 from .fetch import (
     FetchBlockedError,
     FetchError,
@@ -681,6 +682,26 @@ async def flow_scan(
     """
     _require_api_key(authorization)
     return await do_flow_scan(req)
+
+
+@app.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
+async def dashboard_page() -> HTMLResponse:
+    """Localhost KPI dashboard (read-only, unauthenticated by design)."""
+    return HTMLResponse(DASHBOARD_HTML)
+
+
+@app.get("/dashboard/data", include_in_schema=False)
+async def dashboard_data() -> dict[str, Any]:
+    """JSON payload behind /dashboard (read-only, unauthenticated by design)."""
+    if not persistence_enabled():
+        raise HTTPException(
+            status_code=400,
+            detail=_error_payload(
+                "PERSISTENCE_DISABLED",
+                "Dashboard data is unavailable because persistence is disabled.",
+            ),
+        )
+    return build_dashboard_data()
 
 
 @app.get("/flow-calibration", response_model=FlowCalibrationResponse)

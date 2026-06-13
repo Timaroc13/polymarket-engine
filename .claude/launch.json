@@ -1,0 +1,14 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "dashboard-preview",
+      "runtimeExecutable": "cmd",
+      "runtimeArgs": [
+        "/c",
+        "set SCHEDULER_ENABLE=0&& set ENABLE_PERSISTENCE=1&& set DB_PATH=C:/dev/crypto-news-parser/data.sqlite3&& .venv\\Scripts\\python.exe -m uvicorn crypto_news_parser.main:app --app-dir src --port 8010"
+      ],
+      "port": 8010
+    }
+  ]
+}

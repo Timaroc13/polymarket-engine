@@ -420,6 +420,43 @@ def track_market_if_new(*, condition_id: str, question: str | None = None) -> No
         conn.close()
 
 
+def _calibration_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Latest scan per resolved market (at or before resolution), with outcome.
+
+    Shared by get_flow_calibration and get_calibration_timeline.
+    """
+    return conn.execute(
+        """
+        SELECT fs.risk_tier, fs.dominant_side, fs.p_market_at_scan, tm.outcome,
+               tm.resolved_at
+        FROM tracked_markets tm
+        JOIN flow_scans fs ON fs.id = (
+            SELECT fs2.id FROM flow_scans fs2
+            WHERE fs2.condition_id = tm.condition_id
+              AND (tm.resolved_at IS NULL OR fs2.created_at <= tm.resolved_at)
+            ORDER BY fs2.created_at DESC, fs2.id DESC
+            LIMIT 1
+        )
+        WHERE tm.resolved = 1
+        ORDER BY tm.resolved_at ASC
+        """
+    ).fetchall()
+
+
+def _qualify_row(row: sqlite3.Row) -> tuple[int, float | None, str] | None:
+    """Map a calibration row to (win, implied, tier), or None when excluded."""
+    dom = row["dominant_side"]
+    outcome = (str(row["outcome"]).strip().upper() if row["outcome"] is not None else "")
+    if dom not in ("YES", "NO") or outcome not in ("YES", "NO"):
+        return None
+    win = 1 if outcome == dom else 0
+    yes_price = row["p_market_at_scan"]
+    implied: float | None = None
+    if yes_price is not None:
+        implied = float(yes_price) if dom == "YES" else 1.0 - float(yes_price)
+    return win, implied, str(row["risk_tier"])
+
+
 def get_flow_calibration() -> dict[str, Any]:
     """Join the latest flow scan per market with resolved outcomes.
 
@@ -434,20 +471,7 @@ def get_flow_calibration() -> dict[str, Any]:
     conn = _connect()
     try:
         init_db(conn)
-        rows = conn.execute(
-            """
-            SELECT fs.risk_tier, fs.dominant_side, fs.p_market_at_scan, tm.outcome
-            FROM tracked_markets tm
-            JOIN flow_scans fs ON fs.id = (
-                SELECT fs2.id FROM flow_scans fs2
-                WHERE fs2.condition_id = tm.condition_id
-                  AND (tm.resolved_at IS NULL OR fs2.created_at <= tm.resolved_at)
-                ORDER BY fs2.created_at DESC, fs2.id DESC
-                LIMIT 1
-            )
-            WHERE tm.resolved = 1
-            """
-        ).fetchall()
+        rows = _calibration_rows(conn)
 
         def _empty_bucket() -> dict[str, Any]:
             return {"n": 0, "wins": 0, "_implied_sum": 0.0, "_implied_n": 0}
@@ -461,19 +485,12 @@ def get_flow_calibration() -> dict[str, Any]:
         excluded = 0
 
         for r in rows:
-            dom = r["dominant_side"]
-            outcome = (str(r["outcome"]).strip().upper() if r["outcome"] is not None else "")
-            if dom not in ("YES", "NO") or outcome not in ("YES", "NO"):
+            qualified = _qualify_row(r)
+            if qualified is None:
                 excluded += 1
                 continue
-
-            win = 1 if outcome == dom else 0
-            yes_price = r["p_market_at_scan"]
-            implied: float | None = None
-            if yes_price is not None:
-                implied = float(yes_price) if dom == "YES" else 1.0 - float(yes_price)
-
-            tier = str(r["risk_tier"]) if str(r["risk_tier"]) in tiers else "LOW"
+            win, implied, tier = qualified
+            tier = tier if tier in tiers else "LOW"
             for bucket in (overall, tiers[tier]):
                 bucket["n"] += 1
                 bucket["wins"] += win
@@ -506,6 +523,108 @@ def get_flow_calibration() -> dict[str, Any]:
             "overall": _finalize(overall),
             "tiers": {k: _finalize(v) for k, v in tiers.items()},
             "excluded": excluded,
+        }
+    finally:
+        conn.close()
+
+
+def get_calibration_timeline() -> list[dict[str, Any]]:
+    """Lift evolution: one point per qualifying resolution, in resolution order.
+
+    Each point carries cumulative calibration for overall and for HIGH tier:
+    {resolved_at, n, win_rate, avg_implied, lift, n_high, lift_high}.
+    """
+    conn = _connect()
+    try:
+        init_db(conn)
+        rows = _calibration_rows(conn)
+    finally:
+        conn.close()
+
+    def _cum(state: dict[str, float], win: int, implied: float | None) -> None:
+        state["n"] += 1
+        state["wins"] += win
+        if implied is not None:
+            state["imp_sum"] += implied
+            state["imp_n"] += 1
+
+    def _lift(state: dict[str, float]) -> tuple[float | None, float | None]:
+        if state["n"] == 0:
+            return None, None
+        win_rate = state["wins"] / state["n"]
+        if state["imp_n"] == 0:
+            return round(win_rate, 4), None
+        return round(win_rate, 4), round(win_rate - state["imp_sum"] / state["imp_n"], 4)
+
+    overall = {"n": 0, "wins": 0, "imp_sum": 0.0, "imp_n": 0}
+    high = {"n": 0, "wins": 0, "imp_sum": 0.0, "imp_n": 0}
+    points: list[dict[str, Any]] = []
+    for r in rows:
+        qualified = _qualify_row(r)
+        if qualified is None:
+            continue
+        win, implied, tier = qualified
+        _cum(overall, win, implied)
+        if tier == "HIGH":
+            _cum(high, win, implied)
+        win_rate, lift = _lift(overall)
+        win_rate_high, lift_high = _lift(high)
+        avg_implied = (
+            round(overall["imp_sum"] / overall["imp_n"], 4) if overall["imp_n"] else None
+        )
+        points.append({
+            "resolved_at": r["resolved_at"],
+            "n": int(overall["n"]),
+            "win_rate": win_rate,
+            "avg_implied": avg_implied,
+            "lift": lift,
+            "n_high": int(high["n"]),
+            "lift_high": lift_high,
+        })
+    return points
+
+
+def get_recent_scans(limit: int = 50) -> list[dict[str, Any]]:
+    """Most recent flow-scan rows, newest first."""
+    conn = _connect()
+    try:
+        init_db(conn)
+        rows = conn.execute(
+            """
+            SELECT created_at, condition_id, question, signal_score, risk_tier,
+                   dominant_side, dominant_side_usdc, p_market_at_scan
+            FROM flow_scans ORDER BY id DESC LIMIT ?
+            """,
+            (int(limit),),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_dashboard_stats() -> dict[str, Any]:
+    """Operational counters for the dashboard."""
+    conn = _connect()
+    try:
+        init_db(conn)
+        scans_total = int(conn.execute("SELECT COUNT(*) FROM flow_scans").fetchone()[0])
+        last_scan = conn.execute("SELECT MAX(created_at) FROM flow_scans").fetchone()[0]
+        unresolved = int(
+            conn.execute("SELECT COUNT(*) FROM tracked_markets WHERE resolved = 0").fetchone()[0]
+        )
+        resolved = int(
+            conn.execute("SELECT COUNT(*) FROM tracked_markets WHERE resolved = 1").fetchone()[0]
+        )
+        row = conn.execute(
+            "SELECT deployed FROM capital_ledger WHERE id = ?", (_CAPITAL_LEDGER_ID,)
+        ).fetchone()
+        deployed = float(row["deployed"]) if row else 0.0
+        return {
+            "scans_total": scans_total,
+            "last_scan_at": last_scan,
+            "tracked_unresolved": unresolved,
+            "tracked_resolved": resolved,
+            "deployed": deployed,
         }
     finally:
         conn.close()

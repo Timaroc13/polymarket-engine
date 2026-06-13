@@ -123,9 +123,9 @@ and sends a Telegram alert for every HIGH-tier market. Optional tuning:
 
 ### Weekly review
 
-```powershell
-curl http://localhost:8000/flow-calibration
-```
+Open **http://localhost:8000/dashboard** — Gate-1 progress bar, HIGH lift, lift-evolution
+chart, and the latest scans, auto-refreshing. (The raw JSON remains at
+`GET /flow-calibration` and `GET /dashboard/data`.)
 
 Read it against the gates in §3. Expect `n` to grow by roughly the number of scanned markets
 that resolve per week (with 7-day-expiry markets, most of what you scan resolves within the week).
