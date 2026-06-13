@@ -13,3 +13,4 @@ data.sqlite3
 
 # Temporary eval exports
 eval/_tmp_*.jsonl
+logs/
