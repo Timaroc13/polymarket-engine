@@ -84,8 +84,16 @@ pytest
   - `max_wallets` caps wallet-metadata lookups per market to the top-N wallets by position size (the slow part). Unset = full fidelity, but a single high-volume market can take 15+ minutes; `300` is a good scheduled-scan default.
   - Scans active Polymarket markets for informed-trading flow: reconstructs per-wallet net positions from recent trades and flags **new wallets** (≤14 days old, exactly 1 market traded) piling onto one side.
   - Returns per market: `signal_score` (0–100), `risk_tier` (LOW/MEDIUM/HIGH), `dominant_side`, new-wallet counts/USDC, `recent_burst_pct`, and `p_market_at_scan` (YES implied probability at scan time).
-  - When persistence is enabled, every scanned market is logged to `flow_scans` and auto-registered in `tracked_markets`, so the existing `POST /poll-resolutions` cron resolves it.
-  - **Slow by design**: a 20-market scan makes hundreds of Polymarket API calls and can take minutes. Call it from a scheduler (e.g. an n8n cron every few hours), not interactively.
+  - When persistence is enabled, every scanned market is logged to `flow_scans` and auto-registered in `tracked_markets`, so resolution polling picks it up.
+  - **Slow by design**: a 20-market scan makes hundreds of Polymarket API calls and can take minutes. Prefer the built-in scheduler (below) over interactive calls.
+
+### Built-in scheduler
+
+Set `SCHEDULER_ENABLE=1` and the server runs the whole loop itself — flow scan every
+`SCAN_INTERVAL_HOURS` (default 4), resolution poll every `POLL_INTERVAL_MINUTES` (default 15),
+and a Telegram alert per market at/above `ALERT_MIN_TIER` (default HIGH) via
+`TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`. Scan size: `SCAN_TOP_N` (default 20),
+`SCAN_MAX_WALLETS` (default 300). No n8n required for wallet-flow.
 
 - `GET /flow-calibration`
   - Requires persistence. Joins the latest flow scan per market with resolved outcomes and reports, per risk tier and overall:

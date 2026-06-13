@@ -6,6 +6,7 @@ import logging
 import os
 import urllib.error
 import urllib.request
+from contextlib import asynccontextmanager, suppress
 from typing import Any
 
 from dotenv import load_dotenv
@@ -14,6 +15,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
+from . import scheduler
 from .fetch import (
     FetchBlockedError,
     FetchError,
@@ -87,7 +89,24 @@ SCHEMA_VERSION = "v2"
 MODEL_VERSION = os.getenv("MODEL_VERSION", "news-parser-0.1")
 REQUIRED_API_KEY = os.getenv("API_KEY")
 
-app = FastAPI(title="Crypto News Parser", version=SCHEMA_VERSION)
+
+@asynccontextmanager
+async def _lifespan(app_: FastAPI):
+    tasks: list[asyncio.Task] = []
+    if scheduler.scheduler_enabled():
+        tasks = scheduler.start(scan_fn=do_flow_scan, poll_fn=do_poll_resolutions)
+    app_.state.scheduler_tasks = tasks
+    try:
+        yield
+    finally:
+        for t in tasks:
+            t.cancel()
+        for t in tasks:
+            with suppress(asyncio.CancelledError):
+                await t
+
+
+app = FastAPI(title="Crypto News Parser", version=SCHEMA_VERSION, lifespan=_lifespan)
 
 
 @app.get("/")
@@ -621,18 +640,8 @@ async def reset_deployed(
     return {"deployed": 0.0}
 
 
-@app.post("/flow-scan", response_model=FlowScanResponse)
-async def flow_scan(
-    req: FlowScanRequest,
-    authorization: str | None = Header(default=None),
-) -> FlowScanResponse:
-    """Scan Polymarket markets for informed-trading flow (new-wallet detector).
-
-    Blocking external API calls run in a worker thread; a 20-market scan can
-    take minutes. Intended to be called on a schedule (e.g. n8n cron).
-    """
-    _require_api_key(authorization)
-
+async def do_flow_scan(req: FlowScanRequest) -> FlowScanResponse:
+    """Run a flow scan and persist/track results. Shared by the route and the scheduler."""
     results = await asyncio.to_thread(
         run_scan,
         top_n=req.top_n,
@@ -658,6 +667,20 @@ async def flow_scan(
         scanned=len(results),
         stored=stored,
     )
+
+
+@app.post("/flow-scan", response_model=FlowScanResponse)
+async def flow_scan(
+    req: FlowScanRequest,
+    authorization: str | None = Header(default=None),
+) -> FlowScanResponse:
+    """Scan Polymarket markets for informed-trading flow (new-wallet detector).
+
+    Blocking external API calls run in a worker thread; a 20-market scan can
+    take minutes. Intended for the in-app scheduler or manual/scheduled calls.
+    """
+    _require_api_key(authorization)
+    return await do_flow_scan(req)
 
 
 @app.get("/flow-calibration", response_model=FlowCalibrationResponse)
@@ -727,29 +750,8 @@ async def track_market_endpoint(
     return TrackMarketResponse(market_id=market_id, condition_id=req.condition_id)
 
 
-@app.post("/poll-resolutions", response_model=PollResolutionsResponse)
-async def poll_resolutions(
-    authorization: str | None = Header(default=None),
-) -> PollResolutionsResponse:
-    """Check Polymarket for resolved markets and auto-POST /feedback for each resolution.
-
-    Queries the local DB for all tracked markets that haven't been resolved yet,
-    calls the Polymarket CLOB API for each, and if resolved, stores feedback and
-    marks the market as resolved.
-
-    This endpoint is intended to be called manually or by a scheduler (e.g. n8n cron).
-    """
-    _require_api_key(authorization)
-
-    if not persistence_enabled():
-        raise HTTPException(
-            status_code=400,
-            detail=_error_payload(
-                "PERSISTENCE_DISABLED",
-                "Resolution polling is unavailable because persistence is disabled.",
-            ),
-        )
-
+async def do_poll_resolutions() -> PollResolutionsResponse:
+    """Poll Polymarket for resolved tracked markets. Shared by the route and the scheduler."""
     markets = get_unresolved_markets()
     resolved_items: list[PollResolutionItem] = []
     errors: list[str] = []
@@ -792,3 +794,29 @@ async def poll_resolutions(
         checked=len(markets),
         errors=errors,
     )
+
+
+@app.post("/poll-resolutions", response_model=PollResolutionsResponse)
+async def poll_resolutions(
+    authorization: str | None = Header(default=None),
+) -> PollResolutionsResponse:
+    """Check Polymarket for resolved markets and auto-POST /feedback for each resolution.
+
+    Queries the local DB for all tracked markets that haven't been resolved yet,
+    calls the Polymarket CLOB API for each, and if resolved, stores feedback and
+    marks the market as resolved.
+
+    Called by the in-app scheduler (SCHEDULER_ENABLE=1) or manually.
+    """
+    _require_api_key(authorization)
+
+    if not persistence_enabled():
+        raise HTTPException(
+            status_code=400,
+            detail=_error_payload(
+                "PERSISTENCE_DISABLED",
+                "Resolution polling is unavailable because persistence is disabled.",
+            ),
+        )
+
+    return await do_poll_resolutions()

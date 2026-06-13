@@ -104,14 +104,22 @@ curl -X POST http://localhost:8000/flow-scan -H "Content-Type: application/json"
 curl -X POST http://localhost:8000/flow-scan -H "Content-Type: application/json" -d '{"condition_id": "0x..."}'
 ```
 
-### Scheduled operation (n8n)
+### Scheduled operation (built into the server)
 
-1. **Flow Scan** workflow: import [n8n/flow-scan-workflow.json](n8n/flow-scan-workflow.json) —
-   4-hour cron → `POST /flow-scan` (10-min timeout) → Telegram alert for every `HIGH`-tier market,
-   plus a "Scanner Down" alert on errors. Set n8n variables: `PARSER_URL`, `PARSER_API_KEY`
-   (optional), `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`.
-2. **Poll Resolutions**: already exists in the predict-market-risk workflow (15-minute cron
-   hitting `/poll-resolutions`) — flow-scanned markets ride the same poller automatically.
+No external scheduler needed. Add to `.env` and restart the server:
+
+```
+SCHEDULER_ENABLE=1
+TELEGRAM_BOT_TOKEN=<bot token>
+TELEGRAM_CHAT_ID=<chat id>
+```
+
+That's the whole setup: the server scans every 4 hours, polls resolutions every 15 minutes,
+and sends a Telegram alert for every HIGH-tier market. Optional tuning:
+`SCAN_INTERVAL_HOURS`, `POLL_INTERVAL_MINUTES`, `SCAN_TOP_N` (default 20),
+`SCAN_MAX_WALLETS` (default 300), `ALERT_MIN_TIER` (default HIGH; set MEDIUM for more alerts).
+
+(The news-signal pipeline still runs in n8n — only wallet-flow scheduling moved in-app.)
 
 ### Weekly review
 
