@@ -727,15 +727,60 @@ _POLYMARKET_CLOB_URL = "https://clob.polymarket.com/markets/{condition_id}"
 
 
 def _fetch_polymarket_market(condition_id: str) -> dict[str, Any] | None:
-    """Fetch market data from Polymarket CLOB API. Returns the parsed JSON or None on error."""
+    """Fetch market data from Polymarket CLOB API. Returns the parsed JSON or None on error.
+
+    A User-Agent header is required — without it the CLOB API returns 403.
+    """
     url = _POLYMARKET_CLOB_URL.format(condition_id=condition_id)
-    req = urllib.request.Request(url, headers={"Accept": "application/json"}, method="GET")
+    req = urllib.request.Request(
+        url,
+        headers={"Accept": "application/json", "User-Agent": "polymarket-engine/1.0"},
+        method="GET",
+    )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except Exception as exc:
         logging.getLogger(__name__).warning("Polymarket fetch failed for %s: %s", condition_id, exc)
         return None
+
+
+def _extract_resolution(data: dict[str, Any]) -> str | None:
+    """Return the resolved outcome for a CLOB market, or None if not yet settled.
+
+    The CLOB market records resolution on the `tokens` array: the winning
+    outcome has `winner == True` (price ~1). We map the winning token's
+    *index* to the same YES(0)/NO(1) convention used by `dominant_side` and
+    `p_market_at_scan`, so calibration and paper-trading count it. For
+    non-binary markets (BL-07) the raw winning label is returned, which
+    calibration excludes from the YES/NO math.
+    """
+    if not data.get("closed"):
+        return None
+    tokens = data.get("tokens")
+    if not isinstance(tokens, list) or not tokens:
+        return None
+
+    win_idx: int | None = None
+    win_label: str | None = None
+    for i, t in enumerate(tokens):
+        if isinstance(t, dict) and t.get("winner") is True:
+            win_idx, win_label = i, t.get("outcome")
+            break
+    if win_idx is None:  # fallback: a fully-priced token marks the winner
+        for i, t in enumerate(tokens):
+            try:
+                if isinstance(t, dict) and float(t.get("price") or 0) >= 0.99:
+                    win_idx, win_label = i, t.get("outcome")
+                    break
+            except (TypeError, ValueError):
+                continue
+    if win_idx is None:
+        return None  # closed but not yet settled — keep polling
+
+    if len(tokens) == 2:
+        return "Yes" if win_idx == 0 else "No"
+    return str(win_label) if win_label else None
 
 
 @app.post("/track-market", response_model=TrackMarketResponse)
@@ -783,11 +828,9 @@ async def do_poll_resolutions() -> PollResolutionsResponse:
             errors.append(f"{market.condition_id}: failed to fetch from Polymarket")
             continue
 
-        # Polymarket CLOB API: `resolved` bool + `outcome` string when resolved
-        is_resolved = bool(data.get("resolved") or data.get("closed"))
-        outcome = data.get("outcome") or data.get("winning_outcome")
-
-        if not is_resolved or not outcome:
+        # CLOB marks resolution on the tokens array; map the winner to YES/NO.
+        outcome = _extract_resolution(data)
+        if not outcome:
             continue
 
         # Auto-POST to /feedback
