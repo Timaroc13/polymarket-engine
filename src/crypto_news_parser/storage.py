@@ -97,6 +97,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             dominant_side TEXT,
             dominant_side_usdc REAL NOT NULL DEFAULT 0.0,
             p_market_at_scan REAL,
+            category TEXT,
             result_json TEXT NOT NULL
         )
         """
@@ -105,6 +106,10 @@ def init_db(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_flow_scans_condition"
         " ON flow_scans(condition_id, created_at)"
     )
+    # Migration: add `category` to flow_scans tables created before this column.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(flow_scans)").fetchall()}
+    if "category" not in cols:
+        conn.execute("ALTER TABLE flow_scans ADD COLUMN category TEXT")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS tracked_markets (
@@ -382,8 +387,8 @@ def store_flow_scan(*, result: dict[str, Any]) -> int:
             """
             INSERT INTO flow_scans (
                 created_at, condition_id, question, signal_score, risk_tier,
-                dominant_side, dominant_side_usdc, p_market_at_scan, result_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                dominant_side, dominant_side_usdc, p_market_at_scan, category, result_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(time.time()),
@@ -394,6 +399,7 @@ def store_flow_scan(*, result: dict[str, Any]) -> int:
                 result.get("dominant_side"),
                 float(result.get("dominant_side_usdc") or 0.0),
                 result.get("p_market_at_scan"),
+                result.get("category"),
                 json.dumps(result, ensure_ascii=False),
             ),
         )
@@ -427,8 +433,8 @@ def _calibration_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     """
     return conn.execute(
         """
-        SELECT fs.risk_tier, fs.dominant_side, fs.p_market_at_scan, tm.outcome,
-               tm.resolved_at
+        SELECT fs.risk_tier, fs.dominant_side, fs.p_market_at_scan, fs.category,
+               tm.outcome, tm.resolved_at
         FROM tracked_markets tm
         JOIN flow_scans fs ON fs.id = (
             SELECT fs2.id FROM flow_scans fs2
@@ -612,6 +618,76 @@ def get_paper_entries() -> list[dict[str, Any]]:
             "resolved_at": r["resolved_at"],
         })
     return entries
+
+
+def get_category_breakdown(stake: float = 100.0, fee: float = 0.02) -> list[dict[str, Any]]:
+    """Per-category calibration + paper PnL over resolved markets.
+
+    Returns a list of {category, n, win_rate, avg_implied, lift, pnl, roi},
+    one per category present, sorted by descending n.
+    """
+    conn = _connect()
+    try:
+        init_db(conn)
+        rows = _calibration_rows(conn)
+    finally:
+        conn.close()
+
+    agg: dict[str, dict[str, float]] = {}
+    for r in rows:
+        qualified = _qualify_row(r)
+        if qualified is None:
+            continue
+        win, implied, _tier = qualified
+        if implied is None or not (0.0 < implied < 1.0):
+            continue
+        cat = r["category"] or "other"
+        b = agg.setdefault(cat, {"n": 0, "wins": 0, "imp": 0.0, "pnl": 0.0})
+        b["n"] += 1
+        b["wins"] += win
+        b["imp"] += implied
+        b["pnl"] += stake * (1.0 / implied - 1.0) * (1.0 - fee) if win else -stake
+
+    out: list[dict[str, Any]] = []
+    for cat, b in agg.items():
+        n = int(b["n"])
+        win_rate = b["wins"] / n
+        avg_implied = b["imp"] / n
+        out.append({
+            "category": cat,
+            "n": n,
+            "win_rate": round(win_rate, 4),
+            "avg_implied": round(avg_implied, 4),
+            "lift": round(win_rate - avg_implied, 4),
+            "pnl": round(b["pnl"], 2),
+            "roi": round(b["pnl"] / (n * stake), 4),
+        })
+    out.sort(key=lambda d: d["n"], reverse=True)
+    return out
+
+
+def archive_and_reset_flow_data() -> str:
+    """Archive the DB (timestamped copy) then clear flow_scans + tracked_markets.
+
+    Returns the archive file path. Used by the clean-slate reset.
+    """
+    import shutil
+
+    src = db_path()
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    archive = str(Path(src).with_name(f"data_archive_{ts}.sqlite3"))
+    if Path(src).exists():
+        shutil.copy2(src, archive)
+
+    conn = _connect()
+    try:
+        init_db(conn)
+        with conn:
+            conn.execute("DELETE FROM flow_scans")
+            conn.execute("DELETE FROM tracked_markets")
+    finally:
+        conn.close()
+    return archive
 
 
 def get_recent_scans(limit: int = 50) -> list[dict[str, Any]]:

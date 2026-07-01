@@ -643,6 +643,11 @@ async def reset_deployed(
 
 async def do_flow_scan(req: FlowScanRequest) -> FlowScanResponse:
     """Run a flow scan and persist/track results. Shared by the route and the scheduler."""
+    categories = req.categories
+    if categories is None:
+        env_cats = os.getenv("SCAN_CATEGORIES", "").strip()
+        categories = [c.strip() for c in env_cats.split(",") if c.strip()] or ["crypto"]
+
     results = await asyncio.to_thread(
         run_scan,
         top_n=req.top_n,
@@ -650,6 +655,7 @@ async def do_flow_scan(req: FlowScanRequest) -> FlowScanResponse:
         min_liquidity=req.min_liquidity,
         condition_id=req.condition_id,
         max_wallets=req.max_wallets,
+        categories=categories,
     )
 
     stored = False

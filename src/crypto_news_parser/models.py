@@ -424,7 +424,11 @@ class PollResolutionsResponse(BaseModel):
 class FlowScanRequest(BaseModel):
     top_n: int = Field(20, ge=1, le=50, description="Number of top-volume markets to scan")
     max_days: int = Field(
-        7, ge=1, le=90, description="Only scan markets resolving within this many days"
+        30, ge=1, le=365, description="Only scan markets resolving within this many days"
+    )
+    categories: list[str] | None = Field(
+        None,
+        description="Category allow-list to scan (default: env SCAN_CATEGORIES or ['crypto'])",
     )
     min_liquidity: float = Field(10_000, ge=0, description="Minimum market liquidity in USDC")
     condition_id: str | None = Field(
@@ -452,6 +456,7 @@ class FlowNewWallet(BaseModel):
 class FlowMarketResult(BaseModel):
     market_id: str
     market_question: str
+    category: str = Field("other", description="Market category (crypto, sports, ...)")
     signal_score: int = Field(..., ge=0, le=100)
     risk_tier: str = Field(..., description="LOW | MEDIUM | HIGH")
     dominant_side: str | None = Field(

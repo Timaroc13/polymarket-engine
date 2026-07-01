@@ -80,7 +80,8 @@ pytest
   - Optional config overrides: `min_edge`, `kelly_fraction`, `max_bet_fraction`, `max_exposure_fraction`, `var_tolerance`
 
 - `POST /flow-scan`
-  - Body (all optional): `{ "top_n": 20, "max_days": 7, "min_liquidity": 10000, "max_wallets": 300 }` or `{ "condition_id": "0x..." }` for a single market.
+  - Body (all optional): `{ "top_n": 20, "max_days": 30, "min_liquidity": 10000, "max_wallets": 300, "categories": ["crypto"] }` or `{ "condition_id": "0x..." }` for a single market.
+  - `categories` filters the scan universe (default `["crypto"]` / env `SCAN_CATEGORIES`). The first unfiltered run was 81% sports at negative lift; crypto was the only category with edge — see [METHODOLOGY.md](METHODOLOGY.md) §7. Crypto is fetched via the Gamma `tag_id` filter and tagged on each scan row.
   - `max_wallets` caps wallet-metadata lookups per market to the top-N wallets by position size (the slow part). Unset = full fidelity, but a single high-volume market can take 15+ minutes; `300` is a good scheduled-scan default.
   - Scans active Polymarket markets for informed-trading flow: reconstructs per-wallet net positions from recent trades and flags **new wallets** (≤14 days old, exactly 1 market traded) piling onto one side.
   - Returns per market: `signal_score` (0–100), `risk_tier` (LOW/MEDIUM/HIGH), `dominant_side`, new-wallet counts/USDC, `recent_burst_pct`, and `p_market_at_scan` (YES implied probability at scan time).

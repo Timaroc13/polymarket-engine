@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -33,6 +34,56 @@ REQUEST_DELAY_SECONDS = 0.05  # pacing between calls; bump on 429s
 TRADES_PAGE_SIZE = 500
 TRADES_MAX_OFFSET = 3000  # cumulative hard cap
 MIN_TRADE_USDC = 50       # filter sub-$50 dust
+
+# Gamma tag_ids for server-side category retrieval (verified live).
+# Only crypto is mapped today; categories without a tag_id fall back to a
+# volume-ranked pool classified client-side by classify_category().
+CATEGORY_TAG_IDS = {"crypto": 21}
+DEFAULT_CATEGORIES = ("crypto",)
+
+# ---------- Category classification ----------
+
+_CAT_PATTERNS = [
+    ("sports", re.compile(
+        r"\bvs\.?\b|\bo/u\b|over/under|moneyline|nba|nfl|mlb|nhl|ufc|\bf1\b|"
+        r"grand prix|premier league|la liga|serie a|bundesliga|champions league|"
+        r"world cup|\bwin on \d{4}-", re.I)),
+    ("crypto", re.compile(
+        r"bitcoin|btc|ethereum|\beth\b|solana|\bsol\b|\bxrp\b|dogecoin|\bdoge\b|"
+        r"crypto|token|stablecoin|\bdefi\b|\bnft\b|binance|coinbase|memecoin|"
+        r"altcoin|\busdc\b|\busdt\b|halving|blockchain|\bcoin\b|airdrop", re.I)),
+    ("macro", re.compile(
+        r"\bfed\b|federal reserve|interest rate|rate cut|rate hike|\bbps\b|"
+        r"basis point|\bcpi\b|inflation|recession|jobs report|unemployment|"
+        r"\bgdp\b|fomc|powell", re.I)),
+    ("geopolitics", re.compile(
+        r"\bwar\b|ceasefire|peace deal|invade|invasion|nuclear|treaty|sanction|"
+        r"military|troops|hostage|\bcoup\b|missile|airstrike", re.I)),
+    ("politics", re.compile(
+        r"election|president|senate|congress|governor|nominee|primary|impeach|"
+        r"\btrump\b|\bbiden\b|\bharris\b|republican|democrat|parliament|"
+        r"prime minister|approval rating|ballot|\bvote\b", re.I)),
+    ("tech", re.compile(
+        r"\bipo\b|openai|\bgpt\b|\bapple\b|google|tesla|spacex|nvidia|ai model|"
+        r"product launch|\blaunch a\b", re.I)),
+    ("entertainment", re.compile(
+        r"oscar|grammy|\balbum\b|box office|\bmovie\b|\bfilm\b|celebrity|netflix|"
+        r"\bsong\b|\bemmy\b|award", re.I)),
+]
+
+CATEGORIES = ("crypto", "sports", "macro", "politics", "geopolitics",
+              "tech", "entertainment", "other")
+
+
+def classify_category(question: str, tags: list | None = None) -> str:
+    """Classify a market into one fixed category from its tags + question text."""
+    haystack = question or ""
+    if tags:
+        haystack += " " + " ".join(str(t) for t in tags)
+    for name, pat in _CAT_PATTERNS:
+        if pat.search(haystack):
+            return name
+    return "other"
 
 
 # ---------- HTTP ----------
@@ -116,25 +167,65 @@ def extract_yes_price(market: dict) -> float | None:
 
 # ---------- Gamma: markets ----------
 
-def fetch_top_markets(
-    top_n: int = 20,
-    max_days_to_resolution: int = 7,
-    min_liquidity: float = 10_000,
-) -> list[dict]:
-    """Fetch active, near-resolution markets sorted by 24h volume."""
+def _fetch_category_pool(category: str) -> list[dict]:
+    """Fetch a candidate market pool for one category.
+
+    Uses the Gamma tag_id when known (server-side, reliable — volume-ranking
+    starves minority categories like crypto). Falls back to a volume-ranked
+    pool classified client-side for categories without a tag_id.
+    """
     params = {
         "active": "true",
         "closed": "false",
         "archived": "false",
         "order": "volume24hr",
         "ascending": "false",
-        "limit": 200,
+        "limit": 100,
     }
+    tag_id = CATEGORY_TAG_IDS.get(category)
+    if tag_id is not None:
+        params["tag_id"] = tag_id
+        markets = _get(f"{GAMMA_URL}/markets", params=params)
+        for m in markets:
+            m["_category"] = category
+        return markets
+    # Fallback: general pool, keep only markets that classify to this category.
     markets = _get(f"{GAMMA_URL}/markets", params=params)
+    out = []
+    for m in markets:
+        if classify_category(m.get("question") or "", m.get("tags")) == category:
+            m["_category"] = category
+            out.append(m)
+    return out
+
+
+def fetch_top_markets(
+    top_n: int = 20,
+    max_days_to_resolution: int = 30,
+    min_liquidity: float = 10_000,
+    categories: tuple[str, ...] | list[str] | None = None,
+) -> list[dict]:
+    """Fetch active, near-resolution markets in the allowed categories.
+
+    Default category is crypto (the detector's home turf); the old
+    volume-ranked all-category behaviour is intentionally gone — it was ~81%
+    sports and drowned the signal.
+    """
+    if not categories:
+        categories = DEFAULT_CATEGORIES
+
+    seen: set[str] = set()
+    pool: list[dict] = []
+    for cat in categories:
+        for m in _fetch_category_pool(cat):
+            cid = m.get("conditionId") or m.get("condition_id")
+            if cid and cid not in seen:
+                seen.add(cid)
+                pool.append(m)
 
     now = datetime.now(UTC)
     filtered: list[dict] = []
-    for m in markets:
+    for m in pool:
         end_date_str = m.get("endDate") or m.get("end_date")
         if not end_date_str:
             continue
@@ -510,7 +601,7 @@ def analyze_market(
         p["wallet_total_markets_traded"] = meta.get("markets_traded", 0)
         p["position_created_at_ts"] = p["first_trade_ts_in_market"]
 
-    return detect(
+    result = detect(
         condition_id,
         question,
         market.get("_days_to_resolution", 0),
@@ -521,22 +612,28 @@ def analyze_market(
         volume_1mo=market.get("_volume_1mo_usdc", 0.0),
         p_market_at_scan=extract_yes_price(market),
     )
+    # Category: trust the tag we fetched under; else classify from text.
+    result["category"] = market.get("_category") or classify_category(
+        question, market.get("tags")
+    )
+    return result
 
 
 def run_scan(
     *,
     top_n: int = 20,
-    max_days: int = 7,
+    max_days: int = 30,
     min_liquidity: float = 10_000,
     condition_id: str | None = None,
     max_wallets: int | None = None,
+    categories: tuple[str, ...] | list[str] | None = None,
 ) -> list[dict]:
     """Run a full flow scan. Blocking — callers in async context should use a thread."""
     if condition_id:
         m = fetch_market_by_condition_id(condition_id)
         markets = [m] if m else []
     else:
-        markets = fetch_top_markets(top_n, max_days, min_liquidity)
+        markets = fetch_top_markets(top_n, max_days, min_liquidity, categories=categories)
 
     wallet_cache: dict[str, dict] = {}
     results: list[dict] = []

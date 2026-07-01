@@ -39,10 +39,12 @@ in-app scheduler (every 4h)      in-app scheduler (every 15m)     you (anytime)
            (HIGH tier)
 ```
 
-1. **Scan** (`do_flow_scan`, every `SCAN_INTERVAL_HOURS`): pulls top-volume markets resolving
-   within 7 days, reconstructs per-wallet net USDC positions from recent trades, flags new
-   wallets, scores each market 0–100 → LOW / MEDIUM / HIGH, records `p_market_at_scan` (YES
-   implied probability), stores the row, and **sends a Telegram alert for each HIGH-tier market**.
+1. **Scan** (`do_flow_scan`, every `SCAN_INTERVAL_HOURS`): pulls markets in the configured
+   **category allow-list** (`SCAN_CATEGORIES`, default `crypto` — see §7) resolving within
+   `SCAN_MAX_DAYS` (default 30), reconstructs per-wallet net USDC positions from recent trades,
+   flags new wallets, scores each market 0–100 → LOW / MEDIUM / HIGH, records
+   `p_market_at_scan` and the market `category`, stores the row, and **sends a Telegram alert
+   for each HIGH-tier market**.
 2. **Resolve** (`do_poll_resolutions`, every `POLL_INTERVAL_MINUTES`): scanned markets are
    auto-registered in `tracked_markets`; the poller marks them resolved with the outcome.
 3. **Evaluate** (`GET /dashboard`, anytime): joins the **latest scan per market before
@@ -163,3 +165,28 @@ openspec validate --strict --no-interactive
 - **Local-only**: runs while your PC is on. A missed scan just slows data accumulation;
   nothing is lost. Move to a $5 VPS (same one process) when real money rides on it — note
   the SQLite DB must travel with it, which rules out ephemeral hosts like Cloud Run.
+
+## 7. Category focus (why crypto only)
+
+The first 669-market run (July 2026) was scanned with no category filter, and the result was
+decisive: **259 of 321 qualifying paper trades (81%) were sports**, losing −$4,900 at zero
+lift, while only **6 were crypto** — the *sole* category with positive lift (+0.071) and
+positive PnL (+$65). The new-wallet heuristic only carries signal where a fresh wallet making
+one big bet is *anomalous* and private information exists:
+
+- **Crypto** (default): wallet-native users, real insider events (listings, unlocks, hacks,
+  airdrops). The detector's home turf, and the only category showing edge.
+- **Sports / politics**: fresh wallets are the *norm* (casual retail), so the heuristic is
+  pure noise. Excluded.
+- **Macro / Fed**: no insiders exist for public data releases; efficient. Excluded.
+
+Crypto markets are retrieved server-side via the Gamma `tag_id=21` filter (volume-ranking
+starved them to 6-in-669). They also resolve slower than sports, so `SCAN_MAX_DAYS` defaults
+to 30. Every scan is still tagged with its category, so the dashboard's **By category** panel
+compares them directly — add `tech` to `SCAN_CATEGORIES` later and it segments automatically.
+
+**Clean slate**: the sports-polluted run was archived and cleared before the crypto-only run:
+
+```powershell
+python scripts/reset_flow_data.py --yes   # archives data_archive_<ts>.sqlite3, clears tables
+```

@@ -100,6 +100,7 @@ async def scan_once(scan_fn: ScanFn) -> int:
     """Run one flow scan and alert on markets at/above ALERT_MIN_TIER. Returns alert count."""
     req = FlowScanRequest(
         top_n=_env_int("SCAN_TOP_N", 20),
+        max_days=_env_int("SCAN_MAX_DAYS", 30),
         max_wallets=_env_int("SCAN_MAX_WALLETS", 300),
     )
     resp = await scan_fn(req)

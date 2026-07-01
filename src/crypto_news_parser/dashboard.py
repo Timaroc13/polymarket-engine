@@ -12,6 +12,7 @@ from typing import Any
 from .paper import get_paper_report
 from .storage import (
     get_calibration_timeline,
+    get_category_breakdown,
     get_dashboard_stats,
     get_flow_calibration,
     get_recent_scans,
@@ -28,6 +29,7 @@ def build_dashboard_data() -> dict[str, Any]:
         "recent_scans": get_recent_scans(limit=50),
         "stats": get_dashboard_stats(),
         "paper": get_paper_report(),
+        "by_category": get_category_breakdown(),
         "gates": {"gate1_n": GATE1_N, "gate1_lift": GATE1_LIFT},
     }
 
@@ -79,6 +81,7 @@ DASHBOARD_HTML = """<!doctype html>
   <div class="panel"><h2>Paper trading equity (flat stake per signal)</h2><canvas id="equityChart" height="110"></canvas><div class="empty" id="equityEmpty" style="display:none">Paper trades appear as scanned markets resolve.</div></div>
   <div class="panel"><h2>Paper results by tier</h2><div id="paperTiers"></div></div>
 </div>
+<div class="panel"><h2>By category — is the edge where the thesis says?</h2><div id="byCategory"></div></div>
 <div class="panel"><h2>Latest scans</h2><div id="scans"></div></div>
 <script>
 let liftChart, tierChart, equityChart;
@@ -167,6 +170,16 @@ async function refresh() {
   document.getElementById('paperTiers').innerHTML =
     `<table><tr><th>tier</th><th>trades</th><th>win</th><th>PnL</th><th>ROI</th></tr>${ptRows}</table>` +
     `<div class="hint" style="color:var(--dim);font-size:11px;margin-top:8px">flat $${d.paper.stake} per signal at scan-time price, ${(d.paper.fee*100).toFixed(0)}% fee on winnings — money lens only, gates still rule</div>`;
+
+  // Per-category breakdown
+  const bc = d.by_category || [];
+  document.getElementById('byCategory').innerHTML = bc.length
+    ? `<table><tr><th>category</th><th>n</th><th>win</th><th>implied</th><th>lift</th><th>paper PnL</th><th>ROI</th></tr>` +
+      bc.map(c => `<tr><td>${c.category}</td><td>${c.n}</td><td>${pct(c.win_rate)}</td>` +
+        `<td>${pct(c.avg_implied)}</td><td class="${c.lift>=0.05?'good':(c.lift<0?'bad':'')}">${c.lift>=0?'+':''}${fmt(c.lift,3)}</td>` +
+        `<td class="${c.pnl>0?'good':(c.pnl<0?'bad':'')}">$${fmt(c.pnl,0)}</td><td>${pct(c.roi)}</td></tr>`).join('') +
+      `</table>`
+    : '<div class="empty">No resolved markets yet — category breakdown fills as markets settle.</div>';
 
   // Scan table
   const rows = d.recent_scans.map(s =>
